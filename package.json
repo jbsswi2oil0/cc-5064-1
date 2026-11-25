@@ -1,0 +1,16 @@
+{
+  "name": "software-triangle-raster",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Interactive CPU-only triangle rasterizer with homogeneous clipping, watertight shared edges, intentional seams, debug viewport and numeric pixel audit.",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "test": "node --test test/core.test.js",
+    "render": "node tools/render-offline.mjs",
+    "verify:ui": "node tools/verify-ui.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

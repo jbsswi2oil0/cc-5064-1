@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>软件光栅调试视窗 · Software Triangle Rasterizer</title>
+<link rel="stylesheet" href="/web/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>软件三角形光栅器 <span class="sub">homogeneous clipping · watertight edges · intentional seams</span></h1>
+  <div class="pipeline-badge">
+    <span>内核</span>
+    <select id="pipeline" title="渲染管线">
+      <option value="correct">正确：齐次裁剪 + 透视插值</option>
+      <option value="naive2d">对照：先 ÷w 再 2D 裁剪（会丢面）</option>
+    </select>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="viewer-pane">
+    <div class="canvas-wrap" id="canvasWrap">
+      <canvas id="view" width="960" height="600"></canvas>
+      <canvas id="overlay" width="960" height="600" class="overlay"></canvas>
+      <div id="hint" class="hint">拖动三角面移动资产 · 拖动空白处旋转视角 · 滚轮缩放 · 点击像素审计</div>
+    </div>
+
+    <div class="view-toggles">
+      <label><input type="checkbox" id="showOutlines" checked /> 裁剪轮廓</label>
+      <label><input type="checkbox" id="showMask" /> 覆盖掩码</label>
+      <label><input type="checkbox" id="showSeamOnly" /> 仅看留缝资产</label>
+      <label><input type="checkbox" id="showWeldedOnly" /> 仅看焊接资产</label>
+      <label><input type="checkbox" id="showSliver" checked /> 极细三角形</label>
+      <label><input type="checkbox" id="showDegenerate" /> 退化探针</label>
+      <label class="legend"><span class="sw welded"></span>焊接</label>
+      <label class="legend"><span class="sw seamed"></span>留缝</label>
+      <label class="legend"><span class="sw span"></span>跨平面</label>
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="card">
+      <h2>视图 / 近裁面</h2>
+      <div class="row"><label>近裁面 near</label><input type="range" id="near" min="0.05" max="5.5" step="0.01" /><output id="nearOut"></output></div>
+      <div class="row"><label>视场角 FOV</label><input type="range" id="fov" min="20" max="80" step="1" /><output id="fovOut"></output></div>
+      <div class="row"><label>缝宽 seam</label><input type="range" id="seam" min="0" max="0.02" step="0.0002" /><output id="seamOut"></output></div>
+      <div class="row"><button id="resetBtn">重置场景</button><button id="closeupBtn">贴近缝隙</button></div>
+      <div class="row"><button id="sweepBtn">扫描近裁面 ▶</button><button id="sweepStopBtn">停止</button></div>
+      <div class="row small" id="nearInfo"></div>
+    </section>
+
+    <section class="card">
+      <h2>内核统计</h2>
+      <pre id="stats" class="stats"></pre>
+      <div class="row small" id="seamStatus"></div>
+    </section>
+
+    <section class="card">
+      <h2>像素审计</h2>
+      <div class="row small" id="pixelPick">点击画布任意像素</div>
+      <div id="auditBox" class="audit"></div>
+    </section>
+
+    <section class="card">
+      <h2>坐标与规则约定</h2>
+      <ul class="notes">
+        <li>右手系；相机沿 <b>-Z</b> 看；裁剪空间 <b>-w ≤ x,y,z ≤ w</b>，NDC z ∈ [-1, 1]。</li>
+        <li>屏幕原点左上，屏幕 y 向下；像素中心 <b>(x+0.5, y+0.5)</b>。</li>
+        <li>边函数 8 位定点（SUBPIXEL=256）；左上规则。</li>
+        <li>裁剪生成顶点按 <b>平面 + 排序端点键</b> 缓存：焊接边共享，独立边分离。</li>
+        <li>属性随位置用同一参数 t 插值，÷w 得到透视正确属性。</li>
+      </ul>
+    </section>
+  </aside>
+</main>
+
+<footer class="foot">
+  <span>纯 CPU 内核 · 无 WebGL / 无引擎 · 交互由内核帧驱动</span>
+</footer>
+
+<script type="module" src="/web/app.js"></script>
+</body>
+</html>
