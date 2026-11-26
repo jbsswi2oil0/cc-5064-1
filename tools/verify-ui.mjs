@@ -280,7 +280,69 @@ const orbitAfter = await page.evaluate(() => window.__raster.getState().orbit.ya
 if (Math.abs(orbitAfter - orbit) > 1e-3) ok(`orbit drag changed yaw (${orbit.toFixed(3)} -> ${orbitAfter.toFixed(3)})`);
 else fail('orbit drag did not change yaw');
 
-// 8. No console / page errors anywhere.
+// 8. Kernel <select> drives the live software kernel.
+await page.selectOption('#kernel', 'scalar');
+await page.waitForTimeout(120);
+const scalarKernel = await page.evaluate(() => window.__raster.getFrame().stats.kernel);
+if (scalarKernel === 'scalar') ok('kernel select switched live view to the scalar reference kernel');
+else fail(`kernel select did not take effect (stats.kernel=${scalarKernel})`);
+await page.selectOption('#kernel', 'optimized');
+await page.waitForTimeout(120);
+const optKernel = await page.evaluate(() => window.__raster.getFrame().stats.kernel);
+if (optKernel === 'optimized') ok('kernel select switched live view back to the optimized kernel');
+else fail(`kernel select did not return to optimized (stats.kernel=${optKernel})`);
+
+// 9. REAL compare button on the post-drag/orbit state: both kernels run and
+//    must agree pixel-for-pixel and outline-for-outline, with real timings.
+await page.click('#benchCompareBtn');
+await page.waitForSelector('#benchOut[data-state="pass"]', { timeout: 60000 });
+const cmp = await page.evaluate(() => window.__raster.getLastCompare());
+if (!cmp) fail('compare button did not publish a result');
+else {
+  const zeroDiffs =
+    cmp.identical === true &&
+    cmp.maskAssetDiff === 0 &&
+    cmp.maskPrimDiff === 0 &&
+    cmp.colorDiffPixels === 0 &&
+    cmp.depthDiff === 0 &&
+    cmp.outlineMaxDelta === 0;
+  if (zeroDiffs) {
+    ok(
+      `compare button: 0 coverage/prim/color/depth/outline diffs after drag+orbit ` +
+        `(covered ${cmp.coveredA}, outline pts ${cmp.outlinePointCountA}/${cmp.outlinePointCountB})`
+    );
+  } else {
+    fail(`compare reported diffs: ${JSON.stringify({
+      mask: cmp.maskAssetDiff, prim: cmp.maskPrimDiff, color: cmp.colorDiffPixels,
+      depth: cmp.depthDiff, outline: cmp.outlineMaxDelta, identical: cmp.identical,
+    })}`);
+  }
+  if (cmp.scalarMedianMs > 0 && cmp.optimizedMedianMs > 0 && cmp.speedup > 0) {
+    ok(`compare produced real timings: scalar ${cmp.scalarMedianMs}ms vs opt ${cmp.optimizedMedianMs}ms (${cmp.speedup}x)`);
+  } else fail(`compare timings not positive: ${cmp.scalarMedianMs}/${cmp.optimizedMedianMs}`);
+  if (cmp.optimizedStats && cmp.optimizedStats.bboxPixels > 0 && cmp.scalarStats.fragmentsTested > 0) {
+    ok(
+      `real fragment counters: bbox ${cmp.optimizedStats.bboxPixels}, ` +
+        `scalar tested ${cmp.scalarStats.fragmentsTested}, opt tested ${cmp.optimizedStats.fragmentsTested}, ` +
+        `tiles ${cmp.optimizedStats.tileEmpty}/${cmp.optimizedStats.tileFull}/${cmp.optimizedStats.tilePartial}`
+    );
+  } else fail('compare missing fragment counters');
+  const benchText = await page.evaluate(() => document.getElementById('benchOut').innerText);
+  if (benchText.includes('PASS') && benchText.includes('XOR 叠加标记像素=0')) {
+    ok('compare panel shows PASS and zero XOR-marked pixels');
+  } else fail('compare panel text missing PASS / zero XOR line');
+  const overlayChecked = await page.isChecked('#diffOverlay');
+  if (overlayChecked) ok('diff XOR overlay toggle is enabled after compare');
+  else fail('diff overlay was not enabled');
+}
+await page.evaluate(() => document.getElementById('benchCompareBtn').scrollIntoView({ block: 'center' }));
+await page.waitForTimeout(200);
+await page.screenshot({ path: SHOT_DIR + 'ui-compare.png', fullPage: true });
+await page.evaluate(() => window.scrollTo(0, 0));
+await page.waitForTimeout(150);
+await page.screenshot({ path: SHOT_DIR + 'ui-compare-view.png' });
+
+// 10. No console / page errors anywhere.
 if (errors.length === 0) ok('no console or page errors');
 else fail('errors: ' + errors.join(' | '));
 

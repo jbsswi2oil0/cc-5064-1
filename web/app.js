@@ -28,9 +28,12 @@ let frame = null;
 let selected = null; // { x, y }
 let dragging = null; // { assetId, grabWorld, plane }
 let orbiting = null;
+let lastCompare = null; // real benchmarkPair() result for the current state
+let diffLayer = null; // offscreen canvas holding the coverage XOR overlay
 
 const ui = {
   pipeline: document.getElementById('pipeline'),
+  kernel: document.getElementById('kernel'),
   showOutlines: document.getElementById('showOutlines'),
   showMask: document.getElementById('showMask'),
   showSeamOnly: document.getElementById('showSeamOnly'),
@@ -52,6 +55,9 @@ const ui = {
   seamStatus: document.getElementById('seamStatus'),
   pixelPick: document.getElementById('pixelPick'),
   auditBox: document.getElementById('auditBox'),
+  benchCompareBtn: document.getElementById('benchCompareBtn'),
+  benchOut: document.getElementById('benchOut'),
+  diffOverlay: document.getElementById('diffOverlay'),
 };
 
 const ASSET_COLORS = {
@@ -88,6 +94,10 @@ function pipelineMode() {
   return ui.pipeline.value;
 }
 
+function kernelMode() {
+  return ui.kernel.value;
+}
+
 function render() {
   applyVisibilityToggles();
   // Guard slider states the kernel cannot honour, and show the kernel's own
@@ -97,7 +107,7 @@ function render() {
     return;
   }
   try {
-    frame = renderFrame(buildScene(state), { pipeline: pipelineMode() });
+    frame = renderFrame(buildScene(state), { pipeline: pipelineMode(), kernel: kernelMode() });
   } catch (err) {
     showError(err);
     return;
@@ -208,12 +218,18 @@ function paintOverlay() {
     octx.strokeStyle = 'rgba(255,255,255,0.45)';
     octx.strokeRect(selected.x - 3.5, selected.y - 3.5, 8, 8);
   }
+
+  if (ui.diffOverlay.checked && diffLayer) {
+    octx.drawImage(diffLayer, 0, 0);
+  }
 }
 
 function updateStats() {
   const s = frame.stats;
+  const fmtN = (n) => Number(n).toLocaleString('en-US');
   const lines = [
     `pipeline      ${s.pipeline}`,
+    `kernel        ${s.kernel}`,
     `assets        ${s.assets}`,
     `triangles     ${s.triangles}  (fan ${s.fanTriangles})`,
     `clipped tris  ${s.clippedTriangles}`,
@@ -223,8 +239,20 @@ function updateStats() {
     `subpixel-dgn  ${s.subpixelSkipped}`,
     `non-finite    ${s.nonFiniteSkipped}`,
     `naive dropped ${s.naiveDropped}`,
-    `fragments     ${s.fragmentsTested} tested / ${s.fragmentsPassed} inside`,
+    `bbox slots    ${fmtN(s.bboxPixels)} (traversal upper bound)`,
+    `edge tests    ${fmtN(s.fragmentsTested)}`,
+    `inside/shaded ${fmtN(s.fragmentsPassed)} / ${fmtN(s.fragmentsShaded)}`,
   ];
+  if (s.kernel === 'optimized') {
+    lines.push(
+      `tiles E/F/P   ${fmtN(s.tileEmpty)} / ${fmtN(s.tileFull)} / ${fmtN(s.tilePartial)}`,
+      `proof pixels  ${fmtN(s.proofAcceptedPixels)}`,
+      `empty skipped ${fmtN(s.emptyTilePixelsSkipped)}`,
+      `span early    ${fmtN(s.spanEarlyExits)}`,
+      `small bypass  ${fmtN(s.scalarSmallBypass)}   safe fallback ${fmtN(s.scalarFallbacks)}`
+    );
+  }
+  lines.push(`raster ms     ${s.msRaster.toFixed(2)}   total ${s.msTotal.toFixed(2)}`);
   ui.stats.textContent = lines.join('\n');
 
   const seamSlot = frame.scene.assets.findIndex((a) => a.id === SEAMED);
@@ -527,6 +555,8 @@ ui.seam.addEventListener('input', () => {
   scheduleRender();
 });
 ui.pipeline.addEventListener('change', scheduleRender);
+ui.kernel.addEventListener('change', scheduleRender);
+ui.diffOverlay.addEventListener('change', () => paintOverlay());
 for (const el of [ui.showOutlines, ui.showMask, ui.showSeamOnly, ui.showWeldedOnly, ui.showSliver, ui.showDegenerate]) {
   el.addEventListener('change', () => {
     if (el === ui.showSeamOnly && el.checked) ui.showWeldedOnly.checked = false;
@@ -588,6 +618,112 @@ ui.sweepStopBtn.addEventListener('click', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Real scalar-vs-optimized comparison for the CURRENT state (driven by the
+// button and by automated UI verification). No canned coverage/outlines: both
+// kernels actually render buildScene(state) inside benchmarkPair().
+// ---------------------------------------------------------------------------
+
+function compareSummary(result) {
+  const d = result.diff;
+  return {
+    speedup: result.speedup,
+    identical: d.identical,
+    scalarMedianMs: result.scalar.medianMs,
+    optimizedMedianMs: result.optimized.medianMs,
+    scalarMinMs: result.scalar.minMs,
+    optimizedMinMs: result.optimized.minMs,
+    width: d.width,
+    height: d.height,
+    coveredA: d.coveredA,
+    coveredB: d.coveredB,
+    maskAssetDiff: d.maskAssetDiff,
+    maskPrimDiff: d.maskPrimDiff,
+    colorDiffPixels: d.colorDiffPixels,
+    depthDiff: d.depthDiff,
+    maxColorDelta: d.maxColorDelta,
+    outlineCountA: d.outlineCountA,
+    outlineCountB: d.outlineCountB,
+    outlinePointCountA: d.outlinePointCountA,
+    outlinePointCountB: d.outlinePointCountB,
+    outlineMaxDelta: d.outlineMaxDelta,
+    scalarStats: result.scalar.stats,
+    optimizedStats: result.optimized.stats,
+  };
+}
+
+function buildDiffLayer(result) {
+  const { width, height } = result.diff;
+  if (!diffLayer) diffLayer = document.createElement('canvas');
+  diffLayer.width = width;
+  diffLayer.height = height;
+  const c = diffLayer.getContext('2d');
+  const img = c.createImageData(width, height);
+  const xor = result.coverageXor;
+  let marked = 0;
+  for (let i = 0; i < width * height; i++) {
+    if (xor[i]) {
+      img.data[i * 4] = 255;
+      img.data[i * 4 + 1] = 45;
+      img.data[i * 4 + 2] = 90;
+      img.data[i * 4 + 3] = 220;
+      marked++;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  return marked;
+}
+
+function renderBenchOut(result, marked) {
+  const d = result.diff;
+  const b = result.optimized.stats;
+  const a = result.scalar.stats;
+  const verdict = d.identical ? 'PASS · 逐像素/深度/轮廓完全一致' : 'FAIL · 存在差异，见上';
+  const lines = [
+    verdict,
+    `覆盖像素 scalar=${d.coveredA} optimized=${d.coveredB}`,
+    `maskAsset 差异=${d.maskAssetDiff}  maskPrim 差异=${d.maskPrimDiff}`,
+    `颜色差异像素=${d.colorDiffPixels} (max Δ=${d.maxColorDelta})  深度差异=${d.depthDiff}`,
+    `轮廓 条数 ${d.outlineCountA}/${d.outlineCountB}  点数 ${d.outlinePointCountA}/${d.outlinePointCountB}  最大坐标Δ=${d.outlineMaxDelta}`,
+    `计时中位数 scalar=${result.scalar.medianMs}ms  optimized=${result.optimized.medianMs}ms  提速=${result.speedup}x`,
+    `bbox槽位=${a.bboxPixels}  scalar边测试=${a.fragmentsTested}  opt边测试=${b.fragmentsTested}`,
+    `瓦片 空/满/部分=${b.tileEmpty}/${b.tileFull}/${b.tilePartial}  整瓦证明像素=${b.proofAcceptedPixels}`,
+    `空瓦跳过=${b.emptyTilePixelsSkipped}  提前结束=${b.spanEarlyExits}  小盒旁路=${b.scalarSmallBypass}  安全回退=${b.scalarFallbacks}`,
+    `XOR 叠加标记像素=${marked}（勾选框可在画布查看；0 表示无差异）`,
+  ];
+  ui.benchOut.dataset.state = d.identical ? 'pass' : 'fail';
+  ui.benchOut.textContent = lines.join('\n');
+}
+
+async function runCompare() {
+  ui.benchCompareBtn.disabled = true;
+  ui.benchOut.dataset.state = 'running';
+  ui.benchOut.textContent = '运行中：同一当前场景分别真实运行 scalar 与 optimized 内核（含预热与计时）…';
+  // Let the browser paint the "running" message before the synchronous bench.
+  await new Promise((r) => setTimeout(r, 40));
+  try {
+    const { benchmarkPair } = await import('../src/core/compare.js');
+    const scene = buildScene(state);
+    const result = benchmarkPair(scene, { warmup: 3, iterations: 9, topCosts: 8 });
+    lastCompare = result;
+    const marked = buildDiffLayer(result);
+    ui.diffOverlay.checked = true;
+    renderBenchOut(result, marked);
+    if (frame) paintOverlay();
+    return compareSummary(result);
+  } catch (err) {
+    ui.benchOut.dataset.state = 'error';
+    ui.benchOut.textContent = '对照运行失败: ' + err.message;
+    throw err;
+  } finally {
+    ui.benchCompareBtn.disabled = false;
+  }
+}
+
+ui.benchCompareBtn.addEventListener('click', () => {
+  runCompare().catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -600,6 +736,16 @@ window.__raster = {
   getState: () => state,
   render,
   auditPixel: (x, y) => auditPixel(frame, x, y),
+  setKernel(k) {
+    ui.kernel.value = k;
+    scheduleRender();
+  },
+  // Runs the REAL button path and resolves to a JSON-safe comparison summary.
+  compare: () => runCompare(),
+  clickCompareButton: () => {
+    ui.benchCompareBtn.click();
+  },
+  getLastCompare: () => (lastCompare ? compareSummary(lastCompare) : null),
   setState(patch) {
     Object.assign(state, patch);
     syncUiFromState();

@@ -69,9 +69,10 @@ function makeBuffers(width, height) {
   return { color, depth, maskAsset, maskPrim };
 }
 
-function newStats() {
+export function newStats() {
   return {
     pipeline: 'correct',
+    kernel: 'optimized',
     assets: 0,
     triangles: 0,
     clippedTriangles: 0,
@@ -81,25 +82,55 @@ function newStats() {
     subpixelSkipped: 0,
     nonFiniteSkipped: 0,
     naiveDropped: 0,
+    // Real fragment accounting. fragmentsTested counts pixels that actually
+    // executed the three edge sign tests; bboxPixels is the traversal upper
+    // bound (every bounding-box slot the scalar kernel visits).
     fragmentsTested: 0,
     fragmentsPassed: 0,
+    fragmentsShaded: 0,
+    bboxPixels: 0,
+    proofAcceptedPixels: 0,
+    emptyTilePixelsSkipped: 0,
+    tileEmpty: 0,
+    tileFull: 0,
+    tilePartial: 0,
+    spanEarlyExits: 0,
+    scalarFallbacks: 0,
+    scalarSmallBypass: 0,
+    msTotal: 0,
+    msRaster: 0,
     planeHits: {},
   };
 }
 
+function nowMs() {
+  return typeof globalThis.performance?.now === 'function' ? globalThis.performance.now() : Date.now();
+}
+
 /**
  * Render a scene produced by buildScene().
- * options: { width, height, only: string[] | null, pipeline: 'correct'|'naive2d' }
+ * options: {
+ *   width, height,
+ *   only: string[] | null,
+ *   pipeline: 'correct'|'naive2d',
+ *   kernel: 'optimized'|'scalar'  (optimized = incremental fixed-point edges
+ *                                  + conservative tiles, scalar = reference)
+ * }
  */
 export function renderFrame(scene, options = {}) {
+  const tStart = nowMs();
   const width = options.width ?? scene.state.viewport.width;
   const height = options.height ?? scene.state.viewport.height;
   const pipeline = options.pipeline ?? 'correct';
+  const kernel = options.kernel ?? 'optimized';
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new Error(`invalid render size ${width}x${height}`);
   }
   if (pipeline !== 'correct' && pipeline !== 'naive2d') {
     throw new Error(`unknown pipeline "${pipeline}"`);
+  }
+  if (kernel !== 'optimized' && kernel !== 'scalar') {
+    throw new Error(`unknown raster kernel "${kernel}"`);
   }
 
   const buffers = makeBuffers(width, height);
@@ -108,6 +139,8 @@ export function renderFrame(scene, options = {}) {
   const outlines = [];
   const stats = newStats();
   stats.pipeline = pipeline;
+  stats.kernel = kernel;
+  const rasterFn = kernel === 'scalar' ? rasterizeTriangleScalar : rasterizeTriangleOptimized;
 
   const vp = scene.viewProj;
   const invVp = scene.invViewProj;
@@ -240,12 +273,23 @@ export function renderFrame(scene, options = {}) {
 
       for (let f = 1; f + 1 < screenVerts.length; f++) {
         stats.fanTriangles++;
-        rasterizeTriangle([screenVerts[0], screenVerts[f], screenVerts[f + 1]], {
+        const triPts = [screenVerts[0], screenVerts[f], screenVerts[f + 1]];
+        // Conservative cost boundary applied BEFORE kernel setup: a small
+        // bounding box goes straight to the flat scalar reference, avoiding
+        // both tile classification and a duplicated setup pass.
+        let fn = rasterFn;
+        if (kernel === 'optimized' && smallBboxPrefersScalar(triPts, width, height)) {
+          stats.scalarSmallBypass++;
+          fn = rasterizeTriangleScalar;
+        }
+        const tR0 = nowMs();
+        fn(triPts, {
           width,
           height,
           buffers,
           prims,
           stats,
+          kernel,
           assetId: asset.id,
           assetSlot,
           triangleIndex: triangle.index,
@@ -254,11 +298,13 @@ export function renderFrame(scene, options = {}) {
           planesHit,
           perspectiveCorrect: pipeline === 'correct',
         });
+        stats.msRaster += nowMs() - tR0;
       }
     }
   }
 
   stats.generatedVertices = clipCtx.generated.length;
+  stats.msTotal = nowMs() - tStart;
 
   return {
     width,
@@ -319,9 +365,30 @@ function clipPolygon2D(poly, width, height) {
   return out;
 }
 
-function rasterizeTriangle(pts, ctx) {
+/**
+ * Scalar reference kernel. Every bounding-box pixel evaluates all three edge
+ * functions from the stored fixed-point vertices; barycentrics and attributes
+ * use the direct expressions below. This is the correctness baseline and the
+ * fallback for primitives whose fixed-point arithmetic would leave the exact
+ * safe-integer range. It must stay bit-stable: the optimized kernel is
+ * differentially tested against this function.
+ */
+export function rasterizeTriangleScalar(pts, ctx) {
   const { width, height, buffers, prims, stats } = ctx;
   const { color, depth, maskAsset, maskPrim } = buffers;
+  const cost = {
+    kernel: 'scalar',
+    bboxPixels: 0,
+    edgeTests: 0,
+    inside: 0,
+    depthPassed: 0,
+    shaded: 0,
+    tileEmpty: 0,
+    tileFull: 0,
+    tilePartial: 0,
+    earlyExits: 0,
+    fallback: false,
+  };
   const { area, pts: ordered } = normalizeWinding(pts);
   if (area === 0) {
     stats.degenerateSkipped++;
@@ -354,6 +421,9 @@ function rasterizeTriangle(pts, ctx) {
   const maxY = Math.min(height - 1, Math.ceil(maxYf / SUBPIXEL) + 1);
   if (minX > maxX || minY > maxY) return false;
 
+  cost.bboxPixels = (maxX - minX + 1) * (maxY - minY + 1);
+  stats.bboxPixels += cost.bboxPixels;
+
   const primIndex = prims.length;
   prims.push({
     asset: ctx.assetId,
@@ -361,6 +431,8 @@ function rasterizeTriangle(pts, ctx) {
     triangleIndex: ctx.triangleIndex,
     planesHit: ctx.planesHit,
     perspectiveCorrect: ctx.perspectiveCorrect,
+    kernel: 'scalar',
+    cost,
     vertices: ordered.map((v) => ({
       key: v.key,
       sx: v.sx,
@@ -401,6 +473,7 @@ function rasterizeTriangle(pts, ctx) {
     for (let px = minX; px <= maxX; px++) {
       const fx = Math.round((px + 0.5) * SUBPIXEL);
       stats.fragmentsTested++;
+      cost.edgeTests++;
 
       const w0 = e(vx[1], vy[1], vx[2], vy[2], fx, fy);
       const w1 = e(vx[2], vy[2], vx[0], vy[0], fx, fy);
@@ -409,7 +482,6 @@ function rasterizeTriangle(pts, ctx) {
       if (!(w0 > 0 || (w0 === 0 && tl0))) continue;
       if (!(w1 > 0 || (w1 === 0 && tl1))) continue;
       if (!(w2 > 0 || (w2 === 0 && tl2))) continue;
-
       const l0 = w0 * invArea;
       const l1 = w1 * invArea;
       const l2 = w2 * invArea;
@@ -444,8 +516,10 @@ function rasterizeTriangle(pts, ctx) {
       if (!Number.isFinite(zPersp) || !Number.isFinite(uvx) || !Number.isFinite(uvy)) continue;
 
       stats.fragmentsPassed++;
+      cost.inside++;
       const idx = py * width + px;
       if (!(zPersp < depth[idx])) continue;
+      cost.depthPassed++;
 
       depth[idx] = zPersp;
       maskAsset[idx] = ctx.assetSlot;
@@ -456,7 +530,437 @@ function rasterizeTriangle(pts, ctx) {
       color[o] = Math.min(1, Math.max(0, tex[0] * cr * light));
       color[o + 1] = Math.min(1, Math.max(0, tex[1] * cg * light));
       color[o + 2] = Math.min(1, Math.max(0, tex[2] * cb * light));
+      stats.fragmentsShaded++;
+      cost.shaded++;
       wrote = true;
+    }
+  }
+  return wrote;
+}
+
+// Tile size for the optimized kernel. 8x8 keeps corner classification cheap
+// while the per-row edge increments stay in registers/local variables.
+export const TILE_SIZE = 8;
+
+// Dispatch cost boundary for tiny primitives. When the raw bounding box is at
+// or below this many slots (about a 16x16 region, a handful of 8x8 tiles),
+// tile setup costs as much as the flat scan it replaces, so renderFrame runs
+// the scalar reference directly and the optimized kernel cannot do MORE
+// traversal work than scalar on tiny triangles. Performance heuristic only:
+// either kernel is exact, and the differential tests cover both.
+export const SMALL_BBOX_PIXELS = 256;
+
+// Cheap raw-coordinate estimate of the scanned bounding-box slot count. The
+// +/-1 margin mirrors the fixed-point kernel's expanded box; it is only a
+// performance heuristic, so borderline misclassification stays correct either
+// way (both kernels are differentially identical). Fully off-screen fans are
+// routed to scalar, whose setup rejects them cheaply.
+export function smallBboxPrefersScalar(pts, width, height) {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.sx < minX) minX = p.sx;
+    if (p.sx > maxX) maxX = p.sx;
+    if (p.sy < minY) minY = p.sy;
+    if (p.sy > maxY) maxY = p.sy;
+  }
+  const x0 = Math.max(0, Math.floor(minX) - 1);
+  const x1 = Math.min(width - 1, Math.ceil(maxX) + 1);
+  const y0 = Math.max(0, Math.floor(minY) - 1);
+  const y1 = Math.min(height - 1, Math.ceil(maxY) + 1);
+  if (x0 > x1 || y0 > y1) return true;
+  return (x1 - x0 + 1) * (y1 - y0 + 1) <= SMALL_BBOX_PIXELS;
+}
+
+/**
+ * Shared covered-fragment work for the optimized kernel. This is the exact
+ * scalar attribute/depth/write chain, kept in one monomorphic helper so both
+ * tile paths run stable JIT-compiled code.
+ * Returns 0 (rejected by finite guards), 1 (inside coverage, depth failed),
+ * 2 (depth passed and a texel was written).
+ */
+function shadeFragment(c, w0, w1, w2, px, py) {
+  const { stats, cost } = c;
+  const invArea = c.invArea;
+  const l0 = w0 * invArea;
+  const l1 = w1 * invArea;
+  const l2 = w2 * invArea;
+  if (!Number.isFinite(l0) || !Number.isFinite(l1) || !Number.isFinite(l2)) return 0;
+
+  let denom;
+  let uvx;
+  let uvy;
+  let cr;
+  let cg;
+  let cb;
+  let zPersp;
+  if (c.persp) {
+    const a0 = c.a0;
+    const a1 = c.a1;
+    const a2 = c.a2;
+    const invW = l0 * a0.invW + l1 * a1.invW + l2 * a2.invW;
+    if (!(invW > 0) || !Number.isFinite(invW)) return 0;
+    denom = invW;
+    uvx = (l0 * a0.uv[0] * a0.invW + l1 * a1.uv[0] * a1.invW + l2 * a2.uv[0] * a2.invW) / denom;
+    uvy = (l0 * a0.uv[1] * a0.invW + l1 * a1.uv[1] * a1.invW + l2 * a2.uv[1] * a2.invW) / denom;
+    cr = (l0 * a0.color[0] * a0.invW + l1 * a1.color[0] * a1.invW + l2 * a2.color[0] * a2.invW) / denom;
+    cg = (l0 * a0.color[1] * a0.invW + l1 * a1.color[1] * a1.invW + l2 * a2.color[1] * a2.invW) / denom;
+    cb = (l0 * a0.color[2] * a0.invW + l1 * a1.color[2] * a1.invW + l2 * a2.color[2] * a2.invW) / denom;
+    zPersp = (l0 * a0.ndcZ * a0.invW + l1 * a1.ndcZ * a1.invW + l2 * a2.ndcZ * a2.invW) / denom;
+  } else {
+    const a0 = c.a0;
+    const a1 = c.a1;
+    const a2 = c.a2;
+    denom = 1;
+    uvx = l0 * a0.uv[0] + l1 * a1.uv[0] + l2 * a2.uv[0];
+    uvy = l0 * a0.uv[1] + l1 * a1.uv[1] + l2 * a2.uv[1];
+    cr = l0 * a0.color[0] + l1 * a1.color[0] + l2 * a2.color[0];
+    cg = l0 * a0.color[1] + l1 * a1.color[1] + l2 * a2.color[1];
+    cb = l0 * a0.color[2] + l1 * a1.color[2] + l2 * a2.color[2];
+    zPersp = l0 * a0.ndcZ + l1 * a1.ndcZ + l2 * a2.ndcZ;
+  }
+  if (!Number.isFinite(zPersp) || !Number.isFinite(uvx) || !Number.isFinite(uvy)) return 0;
+
+  stats.fragmentsPassed++;
+  cost.inside++;
+  const idx = py * c.width + px;
+  if (!(zPersp < c.depth[idx])) return 1;
+  cost.depthPassed++;
+
+  c.depth[idx] = zPersp;
+  c.maskAsset[idx] = c.assetSlot;
+  c.maskPrim[idx] = c.primIndex;
+
+  const tex = sampleBilinear(c.texture, uvx, uvy);
+  const o = idx * 3;
+  c.color[o] = Math.min(1, Math.max(0, tex[0] * cr * c.light));
+  c.color[o + 1] = Math.min(1, Math.max(0, tex[1] * cg * c.light));
+  c.color[o + 2] = Math.min(1, Math.max(0, tex[2] * cb * c.light));
+  stats.fragmentsShaded++;
+  cost.shaded++;
+  return 2;
+}
+
+/**
+ * Optimized kernel. Same fixed-point coverage and same attribute math as the
+ * scalar reference; only traversal/work changes:
+ *
+ * Computation order (important for exact equivalence):
+ *   1. identical winding normalization and Math.round(v*256) vertex snap;
+ *   2. identical areaFixed / bbox / top-left tie flags;
+ *   3. exact-integer guard: only run the fast traversal when every edge
+ *      intermediate (coordinate offsets, products, corner values) and every
+ *      x/y increment is a safe integer. Otherwise this primitive is handed to
+ *      rasterizeTriangleScalar, so near-plane and extreme-coordinate inputs
+ *      cannot silently lose precision;
+ *   4. edge values at tile/row origins use the SAME direct edge expression as
+ *      the scalar kernel; interior values are advanced by exact constants per
+ *      pixel-right / row-down step. Inside the guard these integer adds
+ *      reproduce the direct products bit-for-bit;
+ *   5. each 8x8 tile is classified from the exact edge extrema at its four
+ *      extreme sample points:
+ *        - empty: some edge fails at every sample (tie-aware max test),
+ *        - full : every edge passes at every sample (tie-aware min test),
+ *        - partial: anything else -> exact per-pixel top-left tests.
+ *      This is a CONSERVATIVE boundary: only provably empty/full tiles take
+ *      the bulk path; all boundary/ambiguous tiles get the full scalar test;
+ *   6. partial rows scan left to right and stop at the end of the convex
+ *      coverage span (the pass set on an integer row is one interval);
+ *   7. covered pixels run shadeFragment, which keeps the unchanged
+ *      l = w*invArea barycentrics and the unchanged perspective
+ *      multiply/divide order, depth test and writes.
+ */
+export function rasterizeTriangleOptimized(pts, ctx) {
+  const { width, height, buffers, prims, stats } = ctx;
+
+  const { area, pts: ordered } = normalizeWinding(pts);
+  if (area === 0) {
+    stats.degenerateSkipped++;
+    return false;
+  }
+
+  const vx = new Float64Array(3);
+  const vy = new Float64Array(3);
+  for (let i = 0; i < 3; i++) {
+    vx[i] = Math.round(ordered[i].sx * SUBPIXEL);
+    vy[i] = Math.round(ordered[i].sy * SUBPIXEL);
+    if (!Number.isFinite(vx[i]) || !Number.isFinite(vy[i])) {
+      stats.nonFiniteSkipped++;
+      return false;
+    }
+  }
+  const areaFixed = (vx[1] - vx[0]) * (vy[2] - vy[0]) - (vy[1] - vy[0]) * (vx[2] - vx[0]);
+  if (!Number.isFinite(areaFixed) || areaFixed === 0) {
+    stats.subpixelSkipped++;
+    return false;
+  }
+
+  const minXf = Math.min(vx[0], vx[1], vx[2]);
+  const maxXf = Math.max(vx[0], vx[1], vx[2]);
+  const minYf = Math.min(vy[0], vy[1], vy[2]);
+  const maxYf = Math.max(vy[0], vy[1], vy[2]);
+  const minX = Math.max(0, Math.floor(minXf / SUBPIXEL) - 1);
+  const maxX = Math.min(width - 1, Math.ceil(maxXf / SUBPIXEL) + 1);
+  const minY = Math.max(0, Math.floor(minYf / SUBPIXEL) - 1);
+  const maxY = Math.min(height - 1, Math.ceil(maxYf / SUBPIXEL) + 1);
+  if (minX > maxX || minY > maxY) return false;
+
+  // Edge descriptors match the scalar w0,w1,w2 ordering exactly.
+  const ex = [
+    [vx[1], vy[1], vx[2], vy[2]],
+    [vx[2], vy[2], vx[0], vy[0]],
+    [vx[0], vy[0], vx[1], vy[1]],
+  ];
+  const edgeE = (k, px, py) => {
+    const d = ex[k];
+    return (d[2] - d[0]) * (py - d[1]) - (d[3] - d[1]) * (px - d[0]);
+  };
+  const tl = [
+    topLeft(vx[1], vy[1], vx[2], vy[2]),
+    topLeft(vx[2], vy[2], vx[0], vy[0]),
+    topLeft(vx[0], vy[0], vx[1], vy[1]),
+  ];
+
+  // Exact-integer guard. Require the whole direct edge computation at every
+  // bounding corner plus every per-pixel/per-row increment to be an exact safe
+  // integer; otherwise repeated addition could diverge from the scalar's
+  // direct products, so run the actual scalar reference for this primitive.
+  const fxLo = Math.round((minX + 0.5) * SUBPIXEL);
+  const fxHi = Math.round((maxX + 0.5) * SUBPIXEL);
+  const fyLo = Math.round((minY + 0.5) * SUBPIXEL);
+  const fyHi = Math.round((maxY + 0.5) * SUBPIXEL);
+  let exactIntegers = Number.isSafeInteger(areaFixed);
+  if (exactIntegers) {
+    for (let i = 0; i < 3; i++) {
+      if (!Number.isSafeInteger(vx[i]) || !Number.isSafeInteger(vy[i])) {
+        exactIntegers = false;
+        break;
+      }
+    }
+  }
+  for (let k = 0; k < 3 && exactIntegers; k++) {
+    const d = ex[k];
+    const dx = d[2] - d[0];
+    const dy = d[3] - d[1];
+    const sx = -dy * SUBPIXEL;
+    const sy = dx * SUBPIXEL;
+    if (
+      !Number.isSafeInteger(dx) ||
+      !Number.isSafeInteger(dy) ||
+      !Number.isSafeInteger(sx) ||
+      !Number.isSafeInteger(sy)
+    ) {
+      exactIntegers = false;
+      break;
+    }
+    for (const fx of [fxLo, fxHi]) {
+      for (const fy of [fyLo, fyHi]) {
+        const ox = fx - d[0];
+        const oy = fy - d[1];
+        const p = dx * oy;
+        const q = dy * ox;
+        const w = p - q;
+        if (
+          !Number.isSafeInteger(ox) ||
+          !Number.isSafeInteger(oy) ||
+          !Number.isSafeInteger(p) ||
+          !Number.isSafeInteger(q) ||
+          !Number.isSafeInteger(w)
+        ) {
+          exactIntegers = false;
+        }
+      }
+    }
+  }
+  if (!exactIntegers) {
+    stats.scalarFallbacks++;
+    return rasterizeTriangleScalar(pts, ctx);
+  }
+
+  const stepX = ex.map((d) => -(d[3] - d[1]) * SUBPIXEL);
+  const stepY = ex.map((d) => (d[2] - d[0]) * SUBPIXEL);
+
+  const cost = {
+    kernel: 'optimized',
+    bboxPixels: (maxX - minX + 1) * (maxY - minY + 1),
+    edgeTests: 0,
+    inside: 0,
+    depthPassed: 0,
+    shaded: 0,
+    tileEmpty: 0,
+    tileFull: 0,
+    tilePartial: 0,
+    earlyExits: 0,
+    fallback: false,
+  };
+  stats.bboxPixels += cost.bboxPixels;
+
+  const primIndex = prims.length;
+  prims.push({
+    asset: ctx.assetId,
+    assetSlot: ctx.assetSlot,
+    triangleIndex: ctx.triangleIndex,
+    planesHit: ctx.planesHit,
+    perspectiveCorrect: ctx.perspectiveCorrect,
+    kernel: 'optimized',
+    cost,
+    vertices: ordered.map((v) => ({
+      key: v.key,
+      sx: v.sx,
+      sy: v.sy,
+      invW: v.invW,
+      ndcZ: v.ndcZ,
+      uv: [...v.uv],
+      color: [...v.color],
+      generatedBy: v.generatedBy,
+      world: [...v.world],
+    })),
+    areaFixed,
+    screenArea: area,
+    texture: ctx.texture,
+    normal: ctx.normal,
+  });
+
+  const invArea = 1 / areaFixed;
+  if (!Number.isFinite(invArea)) {
+    stats.subpixelSkipped++;
+    prims.pop();
+    return false;
+  }
+
+  const c = {
+    width,
+    color: buffers.color,
+    depth: buffers.depth,
+    maskAsset: buffers.maskAsset,
+    maskPrim: buffers.maskPrim,
+    primIndex,
+    assetSlot: ctx.assetSlot,
+    stats,
+    cost,
+    invArea,
+    persp: ctx.perspectiveCorrect,
+    a0: ordered[0],
+    a1: ordered[1],
+    a2: ordered[2],
+    light: shadeFactor(ctx.normal),
+    texture: ctx.texture,
+  };
+
+  let wrote = false;
+  const TILE = TILE_SIZE;
+  const tileX0 = Math.floor(minX / TILE);
+  const tileX1 = Math.floor(maxX / TILE);
+  const tileY0 = Math.floor(minY / TILE);
+  const tileY1 = Math.floor(maxY / TILE);
+
+  for (let ty = tileY0; ty <= tileY1; ty++) {
+    const py0 = Math.max(minY, ty * TILE);
+    const py1 = Math.min(maxY, ty * TILE + TILE - 1);
+
+    for (let tx = tileX0; tx <= tileX1; tx++) {
+      const px0 = Math.max(minX, tx * TILE);
+      const px1 = Math.min(maxX, tx * TILE + TILE - 1);
+
+      const fx0 = Math.round((px0 + 0.5) * SUBPIXEL);
+      const fx1 = Math.round((px1 + 0.5) * SUBPIXEL);
+      const fy0 = Math.round((py0 + 0.5) * SUBPIXEL);
+      const fy1 = Math.round((py1 + 0.5) * SUBPIXEL);
+
+      // Conservative tile classification from exact corner extrema.
+      let tileEmpty = false;
+      let tileFull = true;
+      for (let k = 0; k < 3; k++) {
+        const c00 = edgeE(k, fx0, fy0);
+        const c10 = edgeE(k, fx1, fy0);
+        const c01 = edgeE(k, fx0, fy1);
+        const c11 = edgeE(k, fx1, fy1);
+        const wMax = c00 > c10 ? (c00 > c01 ? (c00 > c11 ? c00 : c11) : c01 > c11 ? c01 : c11) : c10 > c01 ? (c10 > c11 ? c10 : c11) : c01 > c11 ? c01 : c11;
+        const wMin = c00 < c10 ? (c00 < c01 ? (c00 < c11 ? c00 : c11) : c01 < c11 ? c01 : c11) : c10 < c01 ? (c10 < c11 ? c10 : c11) : c01 < c11 ? c01 : c11;
+        if (tl[k] ? wMax < 0 : wMax <= 0) {
+          tileEmpty = true;
+          break;
+        }
+        if (!(tl[k] ? wMin >= 0 : wMin > 0)) tileFull = false;
+      }
+
+      const tilePixels = (px1 - px0 + 1) * (py1 - py0 + 1);
+      if (tileEmpty) {
+        stats.tileEmpty++;
+        cost.tileEmpty++;
+        stats.emptyTilePixelsSkipped += tilePixels;
+        continue;
+      }
+      if (tileFull) {
+        stats.tileFull++;
+        cost.tileFull++;
+        stats.proofAcceptedPixels += tilePixels;
+      } else {
+        stats.tilePartial++;
+        cost.tilePartial++;
+      }
+
+      // Exact edge values at the first sample of the top row; row starts are
+      // advanced by stepY, x values by stepX inside the row.
+      let rw0 = edgeE(0, fx0, fy0);
+      let rw1 = edgeE(1, fx0, fy0);
+      let rw2 = edgeE(2, fx0, fy0);
+      const sx0 = stepX[0];
+      const sx1 = stepX[1];
+      const sx2 = stepX[2];
+      const sy0 = stepY[0];
+      const sy1 = stepY[1];
+      const sy2 = stepY[2];
+
+      if (tileFull) {
+        for (let py = py0; py <= py1; py++) {
+          let w0 = rw0;
+          let w1 = rw1;
+          let w2 = rw2;
+          for (let px = px0; px <= px1; px++) {
+            if (shadeFragment(c, w0, w1, w2, px, py) === 2) wrote = true;
+            w0 += sx0;
+            w1 += sx1;
+            w2 += sx2;
+          }
+          rw0 += sy0;
+          rw1 += sy1;
+          rw2 += sy2;
+        }
+      } else {
+        for (let py = py0; py <= py1; py++) {
+          let w0 = rw0;
+          let w1 = rw1;
+          let w2 = rw2;
+          let entered = false;
+          for (let px = px0; px <= px1; px++) {
+            stats.fragmentsTested++;
+            cost.edgeTests++;
+            const pass =
+              (w0 > 0 || (w0 === 0 && tl[0])) &&
+              (w1 > 0 || (w1 === 0 && tl[1])) &&
+              (w2 > 0 || (w2 === 0 && tl[2]));
+            if (!pass) {
+              if (entered) {
+                stats.spanEarlyExits++;
+                cost.earlyExits++;
+                break;
+              }
+            } else {
+              entered = true;
+              if (shadeFragment(c, w0, w1, w2, px, py) === 2) wrote = true;
+            }
+            w0 += sx0;
+            w1 += sx1;
+            w2 += sx2;
+          }
+          rw0 += sy0;
+          rw1 += sy1;
+          rw2 += sy2;
+        }
+      }
     }
   }
   return wrote;

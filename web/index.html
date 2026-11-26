@@ -10,10 +10,17 @@
 <header class="topbar">
   <h1>软件三角形光栅器 <span class="sub">homogeneous clipping · watertight edges · intentional seams</span></h1>
   <div class="pipeline-badge">
-    <span>内核</span>
+    <span>管线</span>
     <select id="pipeline" title="渲染管线">
       <option value="correct">正确：齐次裁剪 + 透视插值</option>
       <option value="naive2d">对照：先 ÷w 再 2D 裁剪（会丢面）</option>
+    </select>
+  </div>
+  <div class="pipeline-badge">
+    <span>遍历内核</span>
+    <select id="kernel" title="三角形遍历/重心内核">
+      <option value="optimized" selected>优化：增量边函数 + 保守瓦片</option>
+      <option value="scalar">标量参考：逐像素边函数</option>
     </select>
   </div>
 </header>
@@ -54,6 +61,15 @@
       <h2>内核统计</h2>
       <pre id="stats" class="stats"></pre>
       <div class="row small" id="seamStatus"></div>
+    </section>
+
+    <section class="card">
+      <h2>提速对照（真实双内核）</h2>
+      <div class="row">
+        <button id="benchCompareBtn">对照 scalar / optimized</button>
+      </div>
+      <label class="row small"><input type="checkbox" id="diffOverlay" /> 在画布叠加覆盖 XOR（红=不一致像素）</label>
+      <pre id="benchOut" class="stats" data-state="idle">点击按钮：用当前场景分别真实运行标量参考与优化内核，逐像素/轮廓比较并计时。</pre>
     </section>
 
     <section class="card">
